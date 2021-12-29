@@ -1,0 +1,255 @@
+
+library(rvest)
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(quantmod)
+library(PerformanceAnalytics)
+options(digits=4,scipen = 0)
+
+################################################
+
+#setwd("")
+
+#################################################
+#Top 50 SP500 by market Cap 
+#https://www.dogsofthedow.com/largest-companies-by-market-cap.htm
+
+#Top 30 DJ by market Cap 
+#https://www.dogsofthedow.com/dow-jones-industrial-average-companies.htm
+#################################################
+
+
+#################################################
+# Option1: Manual data entry from excel sheet
+#top 50 Aug 2021
+#symbols<-c("AAPL","MSFT","AMZN","GOOGL","FB",
+           "BRK.A","TSLA","TSM","BABA","V","NVDA",
+           "JPM","JNJ","WMT","UNH","MA","PYPL","HD",
+           "PG","BAC","DIS","ASML","ADBE","CMCSA",
+           "NKE","TM","XOM","KO","ORCL","PFE","LLY",
+           "CSCO","VZ","NFLX","CRM","PEP","INTC",
+           "ABT","ABBV","DHR","TMO","NVS","ACN",
+           "T","MRK","AVGO","CVX","SHOP","WFC","COST")
+
+
+#################################################
+# Option2: Manual data entry from excel sheet
+#update sheet name for the month
+
+#top_50<- read_excel("top50_market_cap.xlsx",sheet="top50Aug2021")
+
+#################################################
+# Option3: Harvest data from html 
+#SP500
+sp_url <- "https://www.dogsofthedow.com/largest-companies-by-market-cap.htm"
+
+page <- sp_url %>% 
+  read_html %>%
+  html_nodes("table")
+
+sp_page_html<-html_table(page[1])
+
+top_50<- sp_page_html[[1]]
+
+#################################################
+#DJ
+dj_url <- "https://www.dogsofthedow.com/dow-jones-industrial-average-companies.htm"
+
+page <- dj_url %>% 
+  read_html %>%
+  html_nodes("table")
+
+dj_page_html<-html_table(page[1])
+
+top_30<- dj_page_html[[1]]
+
+#################################################
+
+top_50_symbs<-top_50 %>% select(Symbol)
+top_30_symbs<-top_30 %>% select(Symbol)
+
+top_tickers<-rbind(top_50_symbs,top_30_symbs) %>% unique(.) %>% 
+  filter(symbols!="BRK.A")
+
+#################################################
+#change this to use alternative options
+tickers_list<-top_tickers 
+
+#################################################
+symbols<-c()
+
+for(i in 1:nrow(tickers_list)) {
+  ticker_df<-tickers_list[i,1]
+  symbols<-c(symbols,ticker_df)
+}
+
+symbols<-na.omit(do.call(cbind, symbols)) %>% as.character(.)
+
+################################################
+################################################
+# The prices object will hold our raw price data throughout this book.
+levels <- list()
+getSymbols(symbols, src = 'yahoo', 
+           from = '2018-01-01'
+           #,to = '2022-01-30'
+           )
+for(i in 1:length(symbols)) {
+  prices <- Hi(get(symbols[i]))
+  colnames(prices) <- symbols[i]
+  levels[[i]] <- prices
+}
+
+prices<-na.omit(do.call(cbind, levels))
+
+rm(list=setdiff(ls(), "prices"))
+
+dim(prices)
+
+prices_monthly <- to.monthly(prices, indexAt = "last", OHLC = FALSE)
+
+#prices_monthly<-prices_monthly['/2018-01-31']
+
+returns_monthly <- na.omit(Return.calculate(prices_monthly, method = "log"))
+
+#removing the most recent month due to price vol/reversals
+returns_monthly <- returns_monthly[-nrow(returns_monthly),]
+
+ret_mon_p1 <- returns_monthly + 1
+
+################################################
+################################################
+################################################
+################################################
+#### momentum score calcs
+
+
+#two different mom score calcs
+mom_sc_fun<-function(x){ sum(x)/min(1+x^2) }
+#mom_sc_fun<-function(x){ sum(x)/min(x) }
+
+momentum_score <- lag.xts(rollapply(ret_mon_p1, width = 12, FUN = mom_sc_fun ) )
+
+#momentum_score <- lag.xts(rollapply(ret_mon_p1, width = 12, FUN = prod) -1 )
+
+
+plot(momentum_score)
+
+write.csv(prices_monthly,"prices_monthly.csv",row.names=F)
+write.csv(momentum_score,"momentum_score.csv",row.names=F)
+################################################
+################################################
+################################################
+################################################
+#score_sign <- (sign(momentum_score)+1)/2
+
+#momentum_rank <- data.frame(t(apply(-momentum_score, 1, rank, ties.method='min',na.last="keep")))
+#momentum_signal <- ifelse(momentum_rank<10,1,0)
+
+momentum_pct_rank <- data.frame(t(apply(-momentum_score, 1, percent_rank))) 
+#%>% na.omit(.)
+
+#Critical stock selection threshold
+#long only
+momentum_pct_rnk_signal <- ifelse(momentum_pct_rank < 0.07, 1 , 0) #0.07, 0.09
+
+momentum_selected_stocks<- fortify.zoo(last(momentum_pct_rnk_signal),
+                                       names="date") %>% select(-date) %>% 
+  select_if( function(col) mean(col)==1 ) %>% names(.) %>% print(.)
+
+momentum_returns <- momentum_pct_rnk_signal*returns_monthly
+#*score_sign
+
+
+period_total<-apply(momentum_returns,1,sum) %>% 
+  as.xts(order.by=index(momentum_returns))
+colnames(period_total)<-"period_total"
+
+
+momentum_returns_xts<-cbind.xts(momentum_returns,period_total) %>% na.omit(.)
+momentum_returns_xts$cumsum<-cumsum(momentum_returns_xts$period_total)
+
+
+plot(momentum_returns_xts$cumsum,ylim=c(-2,10))
+lines(momentum_returns_xts$period_total,col="red")
+
+
+strategy_perf<-rbind.data.frame(
+  Return.annualized(momentum_returns_xts$period_total),
+  sd.annualized(momentum_returns_xts$period_total),
+  sqrt(12)*mean(momentum_returns_xts$period_total)/sd(momentum_returns_xts$period_total),
+  #SharpeRatio.annualized(momentum_returns_xts$period_total),
+  AdjustedSharpeRatio(momentum_returns_xts$period_total),
+  SortinoRatio(momentum_returns_xts$period_total),
+  skewness(momentum_returns_xts$period_total),
+  kurtosis(momentum_returns_xts$period_total),
+  mean(momentum_returns_xts$period_total),
+  median(momentum_returns_xts$period_total),
+  min(momentum_returns_xts$period_total),
+  max(momentum_returns_xts$period_total),
+  sd(momentum_returns_xts$period_total),
+  maxDrawdown(momentum_returns_xts$period_total),
+  sum(ifelse(momentum_returns_xts$period_total>0,1,0))/nrow(momentum_returns_xts),
+  VaR(momentum_returns_xts$period_total,p=0.95,method="historical"),
+  max(momentum_returns_xts$cumsum))
+
+rownames(strategy_perf)<-c("Ret",
+                           "Risk",
+                           "Sharpe",
+                           "Sharpe_Adj",
+                           "Sortino",
+                           "Skewness",
+                           "Kurtosis",
+                           "Mean",
+                           "Median",
+                           "Min(Worst Loss)",
+                           "Max",
+                           "SD",
+                           "MaxDD",
+                           "HitRate",
+                           "VaR",
+                           "CumRet")
+print(strategy_perf)
+   
+library(gridExtra)
+library(grid)
+dev.off()
+
+grid.arrange(
+  tableGrob(round(strategy_perf,digits=4)),
+  tableGrob(momentum_selected_stocks),
+  ncol=2)
+
+#### end momentum score calcs ####
+
+charts.PerformanceSummary(momentum_returns_xts$period_total,
+                          Rb=0,col=4,wealth.index=T,
+                          main="Momentum Strategy Cumulative Return Index")
+
+quantile(momentum_returns_xts$period_total,seq(0,1,0.05))
+
+hist(momentum_returns_xts$period_total,20)
+qqnorm(momentum_returns_xts$period_total,col="red",lwd=2)
+qqline(momentum_returns_xts$period_total,col="blue")
+
+
+ret_resample <- sample(momentum_returns_xts$period_total, size=5000, replace=TRUE)
+mean(ret_resample)
+sd(ret_resample)
+quantile(ret_resample,seq(0,1,0.05))
+hist(ret_resample,20)
+qqnorm(ret_resample,col="red",lwd=2)
+qqline(ret_resample,col="blue")
+
+
+chart.RollingPerformance(momentum_returns_xts$period_total,
+                         width=12,FUN="Return.annualized")
+
+
+chart.RollingPerformance(momentum_returns_xts$period_total,
+                         width=12,FUN="sd.annualized")
+
+chart.RollingPerformance(momentum_returns_xts$period_total,
+                         width=12,FUN="SharpeRatio.annualized")
+
+
